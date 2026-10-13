@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "Please cite this software when using the implementation."
+type: software
+title: "PairRoute: Budgeted Evidence Routing with Learned Pairwise Decision Value implementation"
+version: 0.1.0
+authors:
+  - family-names: Hu
+    given-names: Qinao
+license: MIT
+repository-code: "https://github.com/Hqa77880011/pairroute"
