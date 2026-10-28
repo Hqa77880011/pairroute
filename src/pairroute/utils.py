@@ -104,9 +104,10 @@ def plot_results(path, output, metrics=None):
             else None
         )
         if x_key is not None:
-            for method in sorted({r["method"] for r in valid}):
+            for method in sorted({r.get("setting", r["method"]) for r in valid}):
                 subset = sorted(
-                    (r for r in valid if r["method"] == method), key=lambda r: r[x_key]
+                    (r for r in valid if r.get("setting", r["method"]) == method),
+                    key=lambda r: r[x_key],
                 )
                 ax.plot(
                     [r[x_key] for r in subset],

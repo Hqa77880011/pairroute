@@ -63,7 +63,7 @@ class NativeAgent:
             ).get("vote")
         except (ValueError, RuntimeError):
             vote = None
-        if not isinstance(vote, int) or not 0 <= vote < len(session.task["options"]):
+        if type(vote) is not int or not 0 <= vote < len(session.task["options"]):
             vote = None
         message = json.dumps({"owner": self.owner, "vote": vote}, separators=(",", ":"))
         reserved = session.vote_cost * (len(session.names) - self.owner - 1)
@@ -204,6 +204,7 @@ def run_native(args):
         args.revision,
         max_generated=cfg["generation_cap"],
         max_total=cfg["inference_cap"],
+        device=args.device,
     )
     rows = []
     for seed in args.seeds:

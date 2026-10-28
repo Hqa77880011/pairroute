@@ -126,7 +126,7 @@ def dynamic_consensus(owners, ledger, cfg, reserve):
         weights = np.zeros(len(owners.options))
         for owner, state in states.items():
             vote = state.get("vote")
-            if isinstance(vote, int) and 0 <= vote < len(weights):
+            if type(vote) is int and 0 <= vote < len(weights):
                 weights[vote] += trust[owner] * float(
                     np.clip(state.get("confidence", 0), 0, 1)
                 )

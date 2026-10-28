@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+import re
 import time
 import urllib.request
 from collections import Counter, defaultdict
@@ -27,6 +28,32 @@ from .method import (
 from .utils import load, plot_results, save, seed_all
 
 
+def atomic_spans(text, owner):
+    """Retain verbatim sentence/line spans with original character offsets."""
+    boundaries = [
+        0,
+        *[m.end() for m in re.finditer(r"(?<=[.!?])\s+(?=[A-Z])|\n+", text)],
+        len(text),
+    ]
+    facts = []
+    for left, right in zip(boundaries, boundaries[1:]):
+        segment = text[left:right]
+        start = left + len(segment) - len(segment.lstrip())
+        end = right - len(segment) + len(segment.rstrip())
+        if start < end:
+            identifier = str(len(facts))
+            facts.append(
+                {
+                    "id": identifier,
+                    "text": text[start:end],
+                    "source_id": f"{owner}:{identifier}",
+                    "source_start": start,
+                    "source_end": end,
+                }
+            )
+    return facts
+
+
 def prepare(args):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -49,7 +76,7 @@ def prepare(args):
                     + "\n".join(row["shared_information"]),
                     "options": row["possible_answers"],
                     "owners": [
-                        [{"id": "0", "text": fact, "source_id": str(owner) + ":0"}]
+                        atomic_spans(fact, owner)
                         for owner, fact in enumerate(row["hidden_information"])
                     ],
                     "split": "test",
@@ -86,6 +113,7 @@ def synthetic(args):
     tasks, labels = [], []
     families = ["transport", "hardware", "procurement", "network", "facility"]
     for index in range(args.count):
+        validation_template = index >= args.train_count and not args.kind
         family = (
             families[index % len(families)]
             if index < args.train_count or args.kind
@@ -115,7 +143,7 @@ def synthetic(args):
                 owners[j].append(
                     {
                         "id": "critical",
-                        "text": f"{entities[bad]} satisfies {predicate}.",
+                        "text": f"{entities[truth if validation_template else bad]} satisfies {predicate}.",
                     }
                 )
                 critical.append(f"{j}:critical")
@@ -132,14 +160,29 @@ def synthetic(args):
                 rules
                 + f"Any valid option outranks an invalid one. If several options remain valid, prefer {bad}. "
             )
+            if validation_template:
+                public = (
+                    f"The designated storage route {entities[truth]} is eligible only if "
+                    + " AND ".join(predicates)
+                    + " hold. Other routes are fallbacks. Choose the designated route if eligible; otherwise choose a fallback. "
+                )
         else:
-            public = "Choose the option with greatest verified utility. "
+            public = (
+                "Choose the storage route with least verified cost. "
+                if validation_template
+                else "Choose the option with greatest verified utility. "
+            )
             for j in range(3):
-                utility = 10 if j == truth else 1
+                utility = (
+                    (1 if j == truth else 10)
+                    if validation_template
+                    else (10 if j == truth else 1)
+                )
+                quantity = "cost" if validation_template else "utility"
                 owners[j].append(
                     {
                         "id": "critical",
-                        "text": f"{entities[j]} has verified utility {utility}.",
+                        "text": f"{entities[j]} has verified {quantity} {utility}.",
                     }
                 )
             groups = [[f"{j}:critical"] for j in range(3)]
@@ -149,7 +192,11 @@ def synthetic(args):
                 owners[3].append(
                     {
                         "id": "unverified",
-                        "text": f"An unverified rumor says {entities[(truth + 1) % 3]} has utility 99; unverified rumors do not determine verified utility.",
+                        "text": (
+                            f"An unverified rumor says {entities[(truth + 1) % 3]} has cost -99; unverified rumors do not determine verified cost."
+                            if validation_template
+                            else f"An unverified rumor says {entities[(truth + 1) % 3]} has utility 99; unverified rumors do not determine verified utility."
+                        ),
                     }
                 )
         for owner, facts in enumerate(owners):
@@ -173,6 +220,17 @@ def synthetic(args):
                 "owners": owners,
                 "split": split,
                 "source": "controlled_" + kind,
+                "semantic_template_family": (
+                    "positive_eligibility"
+                    if kind in ("pair", "triple")
+                    else "minimum_cost"
+                )
+                if validation_template
+                else (
+                    "negative_conjunction"
+                    if kind in ("pair", "triple")
+                    else "maximum_utility"
+                ),
             }
         )
         labels.append(
@@ -192,23 +250,35 @@ def collect_targets(args):
     from .llm import LocalModel
 
     seed_all(args.seed)
+    tasks = load(args.tasks)
+    if any(t["split"] not in ("train", "validation") for t in tasks):
+        raise ValueError(
+            "Target construction accepts training and validation scenarios only"
+        )
+    if any(t.get("source") in ("hiddenbench", "collabsim") for t in tasks):
+        raise ValueError("Public benchmark scenarios are locked test data")
     llm = LocalModel(
         args.model,
         args.revision,
         seed=args.seed,
         max_generated=1000000,
         max_total=100000000,
+        device=args.device,
     )
     labels = {r["id"]: r for r in load(args.labels)}
+    families = {
+        split: {
+            t["semantic_template_family"]
+            for t in tasks
+            if t["split"] == split and "semantic_template_family" in t
+        }
+        for split in ("train", "validation")
+    }
+    if families["train"] & families["validation"]:
+        raise ValueError("Target train/validation semantic template families overlap")
     examples = []
     rng = random.Random(args.seed)
-    for task in load(args.tasks):
-        if task["split"] not in ("train", "validation"):
-            raise ValueError(
-                "Target construction accepts training and validation scenarios only"
-            )
-        if task.get("source") in ("hiddenbench", "collabsim"):
-            raise ValueError("Public benchmark scenarios are locked test data")
+    for task in tasks:
         llm.reset()
         owners = Owners(task, llm)
         descriptors = [
@@ -250,6 +320,9 @@ def collect_targets(args):
                         "kind": "single",
                         "a": vector(descriptor, history).tolist(),
                         "target": utility,
+                        "teacher_model": args.model,
+                        "teacher_revision": args.revision,
+                        "target_seed": args.seed,
                     }
                 )
             pairs = [
@@ -287,6 +360,9 @@ def collect_targets(args):
                         "b": vector(b, history).tolist(),
                         "relation": relations(a, b).tolist(),
                         "target": interaction,
+                        "teacher_model": args.model,
+                        "teacher_revision": args.revision,
+                        "target_seed": args.seed,
                     }
                 )
         save(args.output, examples)
@@ -300,6 +376,8 @@ def train(args):
     validation = [r for r in rows if r["split"] == "validation"]
     if not training or not validation:
         raise ValueError("Both training and disjoint validation scenarios are required")
+    if {r["id"] for r in training} & {r["id"] for r in validation}:
+        raise ValueError("Training and validation scenario IDs must be disjoint")
     model = Ranker().to(args.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"]
@@ -360,7 +438,22 @@ def train(args):
         if score < best:
             best = score
             torch.save(
-                {"model": model.state_dict(), "config": cfg, "seed": args.seed},
+                {
+                    "model": model.state_dict(),
+                    "config": cfg,
+                    "seed": args.seed,
+                    "teachers": sorted(
+                        {
+                            (
+                                r.get("teacher_model"),
+                                r.get("teacher_revision"),
+                                r.get("target_seed"),
+                            )
+                            for r in rows
+                        },
+                        key=str,
+                    ),
+                },
                 output / "ranker.pt",
             )
         save(output / "history.json", history)
@@ -384,6 +477,10 @@ def route(
         llm.reset()
     start = time.perf_counter()
     rng = random.Random(seed)
+    candidate_cap = cfg.get("candidates_per_owner", 3)
+    fixed_pool = cfg.get("fixed_pool", False)
+    if candidate_cap < 1:
+        raise ValueError("candidates_per_owner must be positive")
     task = dict(task, owners=task["owners"].copy())
     if shuffle_owners:
         rng.shuffle(task["owners"])
@@ -415,18 +512,41 @@ def route(
             for i in range(n)
         ]
     llm.reserve_final_calls(reservations)
-    vote_reserve = sum(
+    vote_owners = ["reader"] if method == "single_reader" else list(range(n))
+    vote_costs = [
         max(
             ledger.length(json.dumps({"owner": i, "vote": j}, separators=(",", ":")))
-            for j in range(len(task["options"]))
+            for j in [None, *range(len(task["options"]))]
         )
-        for i in range(n)
-    )
-    if vote_reserve > budget:
-        raise ValueError("Budget cannot reserve terminal vote delivery")
+        for i in vote_owners
+    ]
+    vote_reserve = sum(vote_costs)
+    if vote_reserve * (2 if collect_votes else 1) > budget:
+        raise ValueError("Budget cannot reserve initial and terminal vote delivery")
+    initial_votes = []
+    if collect_votes:
+        for index, owner in enumerate(vote_owners):
+            if method == "single_reader":
+                response = llm.json(base_prompt, "initial_vote", 32)
+                vote = response.get("vote")
+                vote = (
+                    vote
+                    if type(vote) is int and 0 <= vote < len(owners.options)
+                    else None
+                )
+            else:
+                vote = owners.vote(owner, [], "initial_vote")
+            sent = ledger.send(
+                json.dumps({"owner": owner, "vote": vote}, separators=(",", ":")),
+                ["coordinator"],
+                "initial_vote",
+                vote_reserve + sum(vote_costs[index + 1 :]),
+            )
+            initial_votes.append(vote if sent else None)
     gap_reserve = (
         int(budget / 8)
-        if method
+        if not fixed_pool
+        and method
         not in (
             "no_gap",
             "reveal_all",
@@ -450,7 +570,8 @@ def route(
         "reveal_all",
         "single_reader",
     )
-    for owner in rng.sample(range(n), n):
+    owner_order = rng.sample(range(n), n)
+    for owner in owner_order:
         if method in ("reveal_all", "single_reader"):
             for fact in owners.private[owner]:
                 active.append(
@@ -471,7 +592,16 @@ def route(
             continue
         if method in native_methods:
             continue
-        for descriptor in owners.describe(owner):
+    advertised = (
+        {owner: owners.describe(owner, cap=candidate_cap) for owner in owner_order}
+        if method not in native_methods
+        else {}
+    )
+    for index in range(candidate_cap):
+        for owner in owner_order:
+            if index >= len(advertised.get(owner, [])):
+                continue
+            descriptor = advertised[owner][index]
             message = compact(descriptor)
             charge = ledger.cost(message, ["coordinator"])
             if (
@@ -638,7 +768,14 @@ def route(
                         (overlap(group[0], prior) for prior in updates), default=0
                     )
                 elif method == "rule_pair":
-                    value = 1.0 + (
+                    singleton_value = (
+                        group_value(
+                            group, history, ranker, device, cfg["redundancy"], False
+                        )
+                        if fixed_pool
+                        else 1.0
+                    )
+                    value = singleton_value + (
                         float(relations(*group)[4]) if len(group) == 2 else 0
                     )
                 else:
@@ -648,7 +785,7 @@ def route(
                         ranker,
                         device,
                         0 if method == "no_redundancy" else cfg["redundancy"],
-                        method != "no_interaction",
+                        method not in ("no_interaction", "zero_interaction"),
                     )
                 if value > 0:
                     feasible.append((value / max(cost, 1), group))
@@ -656,6 +793,7 @@ def route(
                 if method == "random" or (
                     method
                     not in ("no_exploration", "reveal_all", "single_reader", "oracle")
+                    and not fixed_pool
                     and rng.random() < cfg["exploration"]
                 ):
                     singletons = [g for _, g in feasible if len(g) == 1]
@@ -741,8 +879,9 @@ def route(
                 recipients = [
                     i
                     for i in question.get("owners", [])
-                    if isinstance(i, int) and 0 <= i < n
+                    if type(i) is int and 0 <= i < n
                 ]
+                recipients = list(dict.fromkeys(recipients))
                 if not recipients:
                     recipients = list(range(n))
                 text = json.dumps(
@@ -752,26 +891,39 @@ def route(
                     },
                     separators=(",", ":"),
                 )
-                if question.get("predicate") and ledger.send(
-                    text, recipients, "gap_request", vote_reserve
+                gap_start = ledger.spent
+                if (
+                    question.get("predicate")
+                    and ledger.cost(text, recipients) <= gap_reserve
+                    and ledger.send(text, recipients, "gap_request", vote_reserve)
                 ):
                     for owner in recipients:
                         available = owners.describe(
-                            owner, condition=question.get("predicate")
+                            owner,
+                            condition=question.get("predicate"),
+                            cap=candidate_cap,
                         )
                         for d in available:
                             if len(
                                 [a for a in active if a["owner"] == owner]
-                            ) >= 3 or any(
+                            ) >= candidate_cap or any(
                                 a["owner"] == owner and a["span_id"] == d["span_id"]
                                 for a in active + updates
                             ):
                                 continue
                             text = compact(d)
-                            if ledger.length(text) <= cfg[
-                                "descriptor_cap"
-                            ] and ledger.send(
-                                text, ["coordinator"], "gap_descriptor", vote_reserve
+                            if (
+                                ledger.length(text) <= cfg["descriptor_cap"]
+                                and ledger.spent
+                                - gap_start
+                                + ledger.cost(text, ["coordinator"])
+                                <= gap_reserve
+                                and ledger.send(
+                                    text,
+                                    ["coordinator"],
+                                    "gap_descriptor",
+                                    vote_reserve,
+                                )
                             ):
                                 active.append(d)
                                 fact = next(
@@ -803,7 +955,10 @@ def route(
             "single_reader",
             32,
         )
-        votes = [answer.get("vote")]
+        vote = answer.get("vote")
+        votes = [
+            vote if type(vote) is int and 0 <= vote < len(owners.options) else None
+        ]
         ledger.send(
             json.dumps({"owner": "reader", "vote": votes[0]}, separators=(",", ":")),
             ["coordinator"],
@@ -820,15 +975,13 @@ def route(
                     ledger.length(
                         json.dumps({"owner": i, "vote": j}, separators=(",", ":"))
                     )
-                    for j in range(len(owners.options))
+                    for j in [None, *range(len(owners.options))]
                 )
                 for i in range(owner + 1, n)
             )
             sent = ledger.send(message, ["coordinator"], "vote", remaining)
             votes.append(vote if sent else None)
-    count = Counter(
-        v for v in votes if isinstance(v, int) and 0 <= v < len(owners.options)
-    )
+    count = Counter(v for v in votes if type(v) is int and 0 <= v < len(owners.options))
     majority = next((v for v, c in count.items() if c > len(votes) / 2), None)
     prompt_tokens, generated_tokens = llm.used()
     return {
@@ -837,7 +990,13 @@ def route(
         "method": method,
         "budget": budget,
         "seed": seed,
+        "candidates_per_owner": candidate_cap,
+        "fixed_pool": fixed_pool,
+        "config": cfg,
+        "model": getattr(llm, "name", None),
+        "revision": getattr(llm, "revision", None),
         "votes": votes,
+        "initial_votes": initial_votes,
         "majority": majority,
         "communication_tokens": ledger.spent,
         "prompt_tokens": prompt_tokens,
@@ -863,15 +1022,64 @@ def route(
 
 def evaluate(rows, labels, audit=None):
     audit = audit or {}
+    if any(type(label["truth"]) is not int for label in labels.values()):
+        raise ValueError(
+            "Gold option identifiers must be integers, not booleans or strings"
+        )
+    keys = [
+        (
+            r["id"],
+            r["method"],
+            r["budget"],
+            r["seed"],
+            r.get("candidates_per_owner", 3),
+            r.get("fixed_pool", False),
+        )
+        for r in rows
+    ]
+    if len(keys) != len(set(keys)):
+        raise ValueError("Duplicate task/method/budget/seed/candidate-setting trace")
+    settings = {
+        (r.get("candidates_per_owner", 3), r.get("fixed_pool", False)) for r in rows
+    }
+    if audit and len(settings) > 1:
+        raise ValueError(
+            "Evaluate delivery audits separately for each candidate setting"
+        )
     summary = []
-    for method, budget in sorted({(r["method"], r["budget"]) for r in rows}):
-        values = [r for r in rows if r["method"] == method and r["budget"] == budget]
+    for method, budget, cap, frozen in sorted(
+        {
+            (
+                r["method"],
+                r["budget"],
+                r.get("candidates_per_owner", 3),
+                r.get("fixed_pool", False),
+            )
+            for r in rows
+        }
+    ):
+        values = [
+            r
+            for r in rows
+            if (
+                r["method"],
+                r["budget"],
+                r.get("candidates_per_owner", 3),
+                r.get("fixed_pool", False),
+            )
+            == (method, budget, cap, frozen)
+        ]
         by_task = defaultdict(list)
         recall, complete, failures = [], [], Counter()
         recalled, critical_count = 0, 0
         for row in values:
             gold = labels[row["id"]]
-            by_task[row["id"]].append(row["majority"] == gold["truth"])
+            correct = (
+                not row.get("error")
+                and type(row["majority"]) is int
+                and row["majority"] == gold["truth"]
+            )
+            by_task[row["id"]].append(correct)
             critical = {f for group in gold.get("critical_groups", []) for f in group}
             audit_key = "|".join(
                 str(row[k]) for k in ("id", "method", "budget", "seed")
@@ -894,7 +1102,7 @@ def evaluate(rows, labels, audit=None):
                 complete.extend(
                     set(group) <= delivered for group in gold["critical_groups"]
                 )
-                if row["majority"] != gold["truth"]:
+                if not correct:
                     if not critical <= set(row["candidate_ids"]):
                         failures["candidate_omission"] += 1
                     elif not completed:
@@ -912,13 +1120,25 @@ def evaluate(rows, labels, audit=None):
         result = {
             "method": method,
             "budget": budget,
+            "candidates_per_owner": cap,
+            "fixed_pool": frozen,
+            "setting": f"{method} (cap={cap}, fixed_pool={frozen})",
+            "task_count": len(by_task),
+            "episode_count": len(values),
+            "seed_count": len({r["seed"] for r in values}),
+            "task_success": {
+                key: float(np.mean(value)) for key, value in by_task.items()
+            },
+            "runtime_error_count": sum(bool(r.get("error")) for r in values),
             "success_percent": 100
             * float(np.mean([np.mean(v) for v in by_task.values()])),
             "individual_vote_accuracy": 100
             * float(
                 np.mean(
                     [
-                        v == labels[r["id"]]["truth"]
+                        not r.get("error")
+                        and type(v) is int
+                        and v == labels[r["id"]]["truth"]
                         for r in values
                         for v in (r["votes"] or [None] * r.get("owner_count", 1))
                     ]
@@ -964,6 +1184,18 @@ def evaluate(rows, labels, audit=None):
                 ]
             )
         )
+        stages = {call["stage"] for r in values for call in r["inference"]}
+        result["inference_stage_seconds"] = {
+            stage: float(
+                np.mean(
+                    [
+                        sum(c["seconds"] for c in r["inference"] if c["stage"] == stage)
+                        for r in values
+                    ]
+                )
+            )
+            for stage in sorted(stages)
+        }
         duplicate_audits = [
             audit.get("|".join(str(r[k]) for k in ("id", "method", "budget", "seed")))
             for r in values
@@ -1005,6 +1237,10 @@ def evaluate(rows, labels, audit=None):
             "vote",
             "direct",
             "discussion",
+            "state",
+            "critique_request",
+            "critique",
+            "state_update",
         ):
             result[stage + "_tokens"] = float(
                 np.mean(
@@ -1111,17 +1347,17 @@ def main():
 
         cfg = load(args.config)
         ranker = Ranker().to(args.device)
-        ranker.load_state_dict(
-            torch.load(args.checkpoint, map_location=args.device, weights_only=True)[
-                "model"
-            ]
+        checkpoint = torch.load(
+            args.checkpoint, map_location=args.device, weights_only=True
         )
+        ranker.load_state_dict(checkpoint["model"])
         ranker.eval()
         llm = LocalModel(
             args.model,
             args.revision,
             max_generated=cfg["generation_cap"],
             max_total=cfg["inference_cap"],
+            device=args.device,
         )
         oracle = (
             {r["id"]: r for r in load(args.oracle_labels)} if args.oracle_labels else {}
@@ -1154,6 +1390,11 @@ def main():
                             "method": args.method,
                             "budget": budget,
                             "seed": seed,
+                            "candidates_per_owner": cfg.get("candidates_per_owner", 3),
+                            "fixed_pool": cfg.get("fixed_pool", False),
+                            "config": cfg,
+                            "model": args.model,
+                            "revision": args.revision,
                             "majority": None,
                             "votes": [None]
                             * (
@@ -1175,6 +1416,7 @@ def main():
                             "candidate_ids": getattr(llm, "route_candidates", []),
                             "error": str(error),
                         }
+                    result["ranker_training_seed"] = checkpoint.get("seed")
                     results.append(result)
                     save(Path(args.output) / "traces.json", results)
     elif args.command == "audit-delivery":

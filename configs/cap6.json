@@ -1,0 +1,26 @@
+{
+  "epochs": 30,
+  "lr": 0.001,
+  "weight_decay": 0.01,
+  "batch_size": 64,
+  "descriptor_cap": 32,
+  "candidates_per_owner": 6,
+  "fixed_pool": false,
+  "exploration": 0.1,
+  "redundancy": 0.05,
+  "generation_cap": 4096,
+  "inference_cap": 65536,
+  "rounds": 4,
+  "dysco_rounds": 3,
+  "dysco_top_k": 2,
+  "dysco_weights": [
+    0.25,
+    0.25,
+    0.25,
+    0.25,
+    0.25
+  ],
+  "dysco_message_cap": 128,
+  "dysco_stop_entropy": 0.3,
+  "trust_smoothing": 0.8
+}

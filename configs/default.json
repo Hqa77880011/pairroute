@@ -4,6 +4,8 @@
   "weight_decay": 0.01,
   "batch_size": 64,
   "descriptor_cap": 32,
+  "candidates_per_owner": 3,
+  "fixed_pool": false,
   "exploration": 0.1,
   "redundancy": 0.05,
   "generation_cap": 4096,

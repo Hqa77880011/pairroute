@@ -22,6 +22,7 @@ METHODS = (
     "single_reader",
     "oracle",
     "no_interaction",
+    "zero_interaction",
     "no_gap",
     "no_exploration",
     "no_redundancy",
@@ -164,12 +165,12 @@ class Owners:
         self.private = task["owners"]
         self.llm = llm
 
-    def describe(self, owner, nominated=None, condition=None):
+    def describe(self, owner, nominated=None, condition=None, cap=3):
         facts = self.private[owner]
         if nominated:
             facts = [f for f in facts if f["id"] in nominated]
         answer = self.llm.json(
-            "Advertise at most three source-traceable atomic spans from your PRIVATE material. Return {candidates:[{span_id,entity,predicate,option,requires,summary}]}. Use short identifiers and a summary of at most three words. A requires value is a complementary condition, or empty. Do not change source claims.\nPUBLIC="
+            f"Advertise at most {cap} source-traceable atomic spans from your PRIVATE material. Return {{candidates:[{{span_id,entity,predicate,option,requires,summary}}]}}. Use short identifiers and a summary of at most three words. A requires value is a complementary condition, or empty. Do not change source claims.\nPUBLIC="
             + self.public
             + "\nOPTIONS="
             + json.dumps(self.options)
@@ -177,12 +178,14 @@ class Owners:
             + json.dumps(facts)
             + ("\nREQUESTED_CONDITION=" + str(condition) if condition else ""),
             "candidate",
-            384,
+            max(384, 128 * cap),
         )
         known = {f["id"]: f for f in facts}
         candidates = []
-        for descriptor in answer.get("candidates", [])[:3]:
-            if descriptor.get("span_id") not in known:
+        for descriptor in answer.get("candidates", [])[:cap]:
+            if descriptor.get("span_id") not in known or any(
+                d["span_id"] == descriptor["span_id"] for d in candidates
+            ):
                 continue
             if not all(
                 isinstance(descriptor.get(k), str)
@@ -231,19 +234,19 @@ class Owners:
             + json.dumps(extra)
         )
 
-    def vote(self, owner, disclosed):
+    def vote(self, owner, disclosed, stage="final_vote"):
         try:
             answer = self.llm.json(
                 self.prompt(owner, disclosed)
                 + "\nChoose the best option. Return {vote: integer option identifier}.",
-                "final_vote",
+                stage,
                 32,
             )
         except ValueError:
             self.llm.ledger[-1]["error"] = "Invalid vote JSON"
             return None
         vote = answer.get("vote")
-        return vote if isinstance(vote, int) and 0 <= vote < len(self.options) else None
+        return vote if type(vote) is int and 0 <= vote < len(self.options) else None
 
     def loss(self, truth, disclosed):
         probabilities = [
