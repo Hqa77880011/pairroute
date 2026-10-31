@@ -114,6 +114,8 @@ Prepared/generated task directories contain separate `tasks.json` and `labels.js
 
 ## Verification
 
+Rechecked on 2026-11-01 using the existing `python tests/smoke.py` with one CPU thread. Optional TensorFlow/Flax backends were disabled (`USE_TF=0`, `USE_FLAX=0`); local test-only dependencies were isolated from the shared Python environment.
+
 The existing implementation was retained. This update repairs charged candidate admission/gap bounds/vote handling and adds the supplemental controls, disjoint scenario templates, grouped evaluation and functional verification. It does not establish that this repository produced the paper's recorded results.
 
 ```bash
