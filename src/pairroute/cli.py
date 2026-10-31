@@ -1280,6 +1280,7 @@ def main():
     train_parser.add_argument("--config", default="configs/default.json")
     native = sub.add_parser("run-collabsim")
     native.add_argument("--source-root", required=True)
+    native.add_argument("--native-max-steps", type=int, help="override native step schedule for a bounded check")
     native.add_argument(
         "--native-config",
         default="configs/study_conditions/hidden_profile/baseline.yml",

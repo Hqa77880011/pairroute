@@ -1,6 +1,7 @@
 import copy
 import json
 import re
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -147,7 +148,7 @@ class Session:
             owner = next((i for i in range(len(self.names)) if i not in recipients), 0)
             self.messages[owner].append(
                 {
-                    "channel": "direct",
+                    "channel": "broadcast" if len(recipients) > 1 else "direct",
                     "content": event["message"],
                     "content_type": "json",
                     "recipients": [self.names[i] for i in recipients],
@@ -155,7 +156,8 @@ class Session:
             )
 
 
-def run_native(args):
+def run_native(args, llm=None):
+    """Execute the actual supplied CollabSim controller; optionally inject a test model."""
     import yaml
 
     root = Path(args.source_root).resolve()
@@ -163,10 +165,24 @@ def run_native(args):
     from src.agents.interface import AgentMetadata
     from src.controller.controller import ExperimentState
     from src.controller.factory import build_controller
+    from src.data import events as native_events
     from src.probe.loader import load_probe_templates
-    from .llm import LocalModel
+
+    # Upstream 08ed0ed's own hidden-profile handler emits these vote events,
+    # but its taxonomy omits them: validation aborts the handler before complete.
+    event_compatibility = [name for name in (
+        "hidden_profile_initial_vote_submitted", "hidden_profile_final_vote_submitted"
+    ) if name not in native_events.EVENT_TYPES]
+    native_events.EVENT_TYPES += tuple(event_compatibility)
 
     native = yaml.safe_load((root / args.native_config).read_text(encoding="utf-8"))
+    if getattr(args, "native_max_steps", None) is not None:
+        if args.native_max_steps < 3:
+            raise ValueError("Native hidden-profile checks need at least three steps")
+        native["experiment"]["max_steps"] = args.native_max_steps
+    source_commit = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+    ).strip() if (root / ".git").exists() else None
     cfg = load(args.config)
     names = [agent["id"] for agent in native["agents"]]
     source = native["task"]
@@ -199,13 +215,13 @@ def run_native(args):
         ]
     )
     ranker.eval()
-    llm = LocalModel(
-        args.model,
-        args.revision,
-        max_generated=cfg["generation_cap"],
-        max_total=cfg["inference_cap"],
-        device=args.device,
-    )
+    if llm is None:
+        from .llm import LocalModel
+
+        llm = LocalModel(
+            args.model, args.revision, max_generated=cfg["generation_cap"],
+            max_total=cfg["inference_cap"], device=args.device,
+        )
     rows = []
     for seed in args.seeds:
         seed_all(seed)
@@ -255,6 +271,12 @@ def run_native(args):
             serial_seconds=time.perf_counter() - started,
             native_events=state.event_log,
             native_complete=state.task_state.get("complete", False),
+            native_steps=state.step_index,
+            native_source_commit=source_commit,
+            native_controller_file=str(Path(sys.modules[ExperimentState.__module__].__file__).resolve()),
+            native_config=args.native_config,
+            native_event_compatibility=event_compatibility,
+            purpose=getattr(args, "purpose", "native_model_evaluation"),
             candidate_ids=(session.routed or {}).get("candidate_ids", []),
             delivered=(session.routed or {}).get("delivered", []),
         )
@@ -265,3 +287,4 @@ def run_native(args):
             Path(args.output) / "labels.json",
             [{"id": task["id"], "truth": options.index(truth)}],
         )
+    return rows

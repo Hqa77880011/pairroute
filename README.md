@@ -96,7 +96,24 @@ An adapter for an externally supplied CollabSim checkout is available:
 pairroute run-collabsim --source-root data/raw/CollabSim --checkpoint checkpoints/ranker/ranker.pt --native-config configs/study_conditions/hidden_profile/baseline.yml --method pairroute --budget 1024 --seeds 0 1 2 --output runs/collabsim
 ```
 
-It expects the upstream `src.controller`, agent interface and hidden-profile configuration API used by `collabsim.py`. The native individual-vote accuracy is separate from HiddenBench majority success. This external adapter has not been run against a real checkout in this update.
+It uses the actual upstream `src.controller`, agent interface, hidden-profile handler and probe API. The native individual-vote accuracy is separate from HiddenBench majority success. `--native-max-steps 8` explicitly bounds a functional run by the upstream step schedule; without that override the supplied native configuration is retained.
+
+The adapter was actually checked against [neuhai/CollabSim at 08ed0ed](https://github.com/neuhai/CollabSim/tree/08ed0ed1cefb2edf1ea389b20ba8355815a7c8d0). Two interface defects were exposed and repaired: upstream direct messages allow only one recipient, so group relays use targeted broadcast; the upstream hidden-profile handler emits initial/final vote events absent from its own `EVENT_TYPES`, causing validation to abort the handler before setting complete. The adapter registers only those two already-emitted event names when missing and records this compatibility action in the trace. The original upstream handler then stores the votes and sets complete itself. Checkout files are unchanged.
+
+Reproduce the bounded native protocol check with no model download:
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/neuhai/CollabSim.git data/raw/CollabSim
+git -C data/raw/CollabSim sparse-checkout set src configs prompts
+git -C data/raw/CollabSim fetch --depth 1 origin 08ed0ed1cefb2edf1ea389b20ba8355815a7c8d0
+git -C data/raw/CollabSim checkout --detach 08ed0ed1cefb2edf1ea389b20ba8355815a7c8d0
+python -m pip install 'litellm>=1.55.0' boto3 tokenizers
+python tests/native_collabsim.py --source-root data/raw/CollabSim --output outputs/native-collabsim
+```
+
+This test asserts the real imported controller's file and Git revision. It uses the upstream baseline's shared/private facts and probe templates, a local WordLevel tokenizer, scripted model replies, fixed positive Ranker weights and eight native steps with one concurrent request. It is an interface/transport check: the scripted vote is fixed to Candidate A, independently of the evaluator answer Candidate C. It does not estimate Qwen reasoning or paper performance. The optional `run_native(args, llm=...)` argument injects that explicit test model; ordinary CLI execution still creates the configured local language model.
+
+The actual CPU run completed in eight steps: three initial and three final votes persisted through the native handler, three paid relays became three native message events and six recipient copies, all final owner prompts received remote source evidence, and nine native probe calls succeeded. Communication was 345 local-fixture tokens, checked as message length × recipient copies for every event; prompt/generated totals were 6,971/552. There were no rejected actions, no reference-answer prompt leakage and no manually forced complete flag. Local verification is retained under `outputs/native-collabsim-final/`; CI checks out that same real upstream revision and repeats the bounded test. On the tested Windows host, inherited `NO_PROXY` contained an IPv6 entry rejected during upstream LiteLLM/httpx import; only the test child process used `NO_PROXY=localhost,127.0.0.1`. No shared environment was changed.
 
 ## Outputs
 
@@ -124,4 +141,4 @@ python tests/smoke.py
 
 Actually passed on Windows, Python 3.13.5, torch 2.7.1+cu118 (CPU), NumPy 2.1.3, SciPy 1.15.3, scikit-learn 1.6.1, transformers 4.57.6 and tokenizers 0.22.1. The check creates random local GPT-2 weights and runs actual forward likelihoods, generation and inference caps. Explicitly scripted owner responses then test routing contracts, not language-model reasoning: teacher second differences averaged over owner views, two optimizer steps with finite gradients and every Ranker parameter updated, checkpoint equivalence and pair symmetry, complete-span feasibility, charged recipient fan-out, invalid uploads, B/8 gap limits, frozen controls, cap-one/six metadata bounds, and strict-majority/recall/group-delivery hand examples. It also runs data conversion and plotting. Small artifacts stay in ignored `outputs/smoke/`.
 
-HiddenBench download/conversion was additionally executed on the real release. Qwen3 target production, real-model owner dialogue/auditing, full training, the benchmark/diagnostic sweeps, and external CollabSim execution remain unverified. Scripted protocol checks and random tiny-model outputs are not benchmark results, and no performance table is filled from them.
+HiddenBench download/conversion was additionally executed on the real release. The real external CollabSim controller/agent/probe interfaces have now passed the bounded scripted check above. Qwen3 target production, real-model owner dialogue/auditing, full training, benchmark/diagnostic sweeps, the original native conditions/repeats and real-model CollabSim outcomes remain unverified. Scripted protocol checks and random tiny-model outputs are not benchmark results, and no performance table is filled from them.
